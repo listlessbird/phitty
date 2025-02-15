@@ -43,7 +43,7 @@
    */
   "placement": {
     "mode": "smart"
-  }
+  },
   /**
    * Bindings
    * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
@@ -69,4 +69,9 @@
    * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
    */
   // "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ] // Runs every minute
+  }
 }

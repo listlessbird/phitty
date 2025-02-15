@@ -1,41 +1,117 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Queue consumer: a Worker that can consume from a
- * Queue: https://developers.cloudflare.com/queues/get-started/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { APIWorkerEnv, Job } from './types';
+import JSZip from 'jszip';
+
+const app = new Hono<{ Bindings: APIWorkerEnv }>();
+
+const jobSchema = z.discriminatedUnion('stage', [
+	z.object({
+		stage: z.literal('yet-to-zip'),
+		packName: z.string(),
+		imageCount: z.number(),
+	}),
+	z.object({
+		stage: z.literal('zipped'),
+		packName: z.string(),
+		imageCount: z.number(),
+		zipKeyinR2: z.string(),
+	}),
+	z.object({
+		stage: z.literal('sent-to-train'),
+		packName: z.string(),
+		imageCount: z.number(),
+		zipKeyinR2: z.string(),
+	}),
+	z.object({
+		stage: z.literal('trained'),
+		packName: z.string(),
+		imageCount: z.number(),
+	}),
+	z.object({
+		stage: z.literal('done'),
+		packName: z.string(),
+		imageCount: z.number(),
+	}),
+]);
+
+async function createZipFromImages(env: APIWorkerEnv, job: Job<'yet-to-zip'>): Promise<ArrayBuffer | null> {
+	try {
+		const zip = new JSZip();
+
+		// key in r2 for images is like train/packName/{01,02,03,...imgCount}.png
+		for (let i = 1; i <= job.imageCount; i++) {
+			const key = `train/${job.packName}/${i.toString().padStart(2, '0')}.png`;
+			const image = await env.R2.get(key);
+			if (!image) {
+				console.error(`Image not found in R2: ${key}`);
+				continue;
+			}
+
+			const imageArrayBuffer = await image.arrayBuffer();
+			zip.file(`${i.toString().padStart(2, '0')}.png`, imageArrayBuffer);
+		}
+
+		return await zip.generateAsync({ type: 'arraybuffer' });
+	} catch (error) {
+		console.error('Error creating zip:', error);
+		return null;
+	}
+}
+
+async function processUnzippedJobs(env: APIWorkerEnv) {
+	try {
+		const { keys } = await env.phitty_kv.list();
+
+		for (const key of keys) {
+			const jobData = await env.phitty_kv.get(key.name, 'json');
+			if (!jobData) continue;
+
+			const jobResult = jobSchema.safeParse(jobData);
+			if (!jobResult.success) continue;
+
+			const job = jobResult.data;
+			if (job.stage !== 'yet-to-zip') continue;
+
+			console.log(`Processing job: ${job.packName}`);
+
+			const zipContent = await createZipFromImages(env, job);
+			if (!zipContent) {
+				console.error(`Failed to create zip for job: ${job.packName}`);
+				continue;
+			}
+
+			const zipKey = `train_packs/${job.packName}.zip`;
+			await env.R2.put(zipKey, zipContent, {
+				customMetadata: {
+					packName: job.packName,
+					createdAt: new Date().toISOString(),
+				},
+			});
+
+			const updatedJob = {
+				...job,
+				stage: 'zipped',
+				zipKeyinR2: zipKey,
+			} satisfies Job<'zipped'>;
+
+			await env.phitty_kv.put(key.name, JSON.stringify(updatedJob));
+			console.log(`Successfully processed job: ${job.packName}`);
+		}
+	} catch (error) {
+		console.error('Error processing unzipped jobs:', error);
+	}
+}
+
+app.get('/', (c) => {
+	return c.json({
+		message: 'Hello, world!',
+	});
+});
 
 export default {
-	// Our fetch handler is invoked on a HTTP request: we can send a message to a queue
-	// during (or after) a request.
-	// https://developers.cloudflare.com/queues/platform/javascript-apis/#producer
-	async fetch(req, env, ctx): Promise<Response> {
-		// To send a message on a queue, we need to create the queue first
-		// https://developers.cloudflare.com/queues/get-started/#3-create-a-queue
-		await env.MY_QUEUE.send({
-			url: req.url,
-			method: req.method,
-			headers: Object.fromEntries(req.headers),
-		});
-		return new Response('Sent message to the queue');
+	fetch: app.fetch,
+	async scheduled(event, env, ctx) {
+		ctx.waitUntil(processUnzippedJobs(env));
 	},
-	// The queue handler is invoked when a batch of messages is ready to be delivered
-	// https://developers.cloudflare.com/queues/platform/javascript-apis/#messagebatch
-	async queue(batch, env): Promise<void> {
-		// A queue consumer can make requests to other endpoints on the Internet,
-		// write to R2 object storage, query a D1 Database, and much more.
-		for (let message of batch.messages) {
-			// Process each message (we'll just log these)
-			console.log(`message ${message.id} processed: ${JSON.stringify(message.body)}`);
-		}
-	},
-} satisfies ExportedHandler<Env, Error>;
+} as ExportedHandler<APIWorkerEnv>;

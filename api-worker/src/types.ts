@@ -1,5 +1,4 @@
 import { DateTime, Str } from "chanfana"
-import exp from "constants"
 import { z } from "zod"
 
 export const Task = z.object({
@@ -17,8 +16,17 @@ export type APIWorkerEnv = {
 
 export type JobStages =
   | "yet-to-zip"
-  | "zipping"
   | "zipped"
   | "sent-to-train"
   | "trained"
   | "done"
+
+export type Job<Stage extends JobStages = JobStages> = {
+  packName: string
+  imageCount: number
+  stage: Stage
+} & (Stage extends "zipped" | "sent-to-train"
+  ? {
+      zipKeyinR2: string
+    }
+  : {})
